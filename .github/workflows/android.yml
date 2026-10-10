@@ -6,8 +6,11 @@ on:
   pull_request:
     branches: [ main, develop ]
   # 手动触发：在仓库 Actions 页面点 “Run workflow” 即可。
-  # 两个输入项：
-  #   build_release —— 是否构建 Release APK（默认开）
+  # 三个输入项：
+  #   build_release  —— 是否构建 Release APK（默认开）
+  #   self_contained —— 是否内嵌运行环境大层（base/node/android-side/dsh），默认开。
+  #                     true = 真正开箱即用：首启无需联网，直接离线装配出完整运行环境；
+  #                     false = 瘦包：首启需联网“在线获取运行环境”或离线导入整包。
   #   unsigned      —— true 产出「真正未签名」的 APK（packageRelease，需自行用
   #                    apksigner/jarsigner 重签后才能安装）；false 用 runner 自动生成的
   #                    debug 密钥签名（即「无自有发布密钥」的 release，可直接侧载安装）。
@@ -20,26 +23,48 @@ on:
         description: '构建 Release APK（手动触发时默认构建）'
         type: boolean
         default: true
+      self_contained:
+        description: '自包含(开箱即用)：内嵌 base/node/android-side/dsh，首启无需联网'
+        type: boolean
+        default: true
       unsigned:
         description: 'true=真正未签名(需自行重签才能装)；false=用 debug 密钥签名(可直接侧载)'
         type: boolean
         default: false
 
-# 运行环境大层的来源（仅 release 构建需要）。
-# 这些层是上游预编译的二进制（PRoot / DSH），与 fork 的代码改动无关，
-# 因此直接复用上游 Release 里已经打好、内嵌进 APK 的那两份：
-#   assets/runtime/android-side.tar.zst  —— 宿主侧 PRoot / loader / shmem
-#   assets/dsh/*.tar.zst                —— DeepSeek Harness 层
-# 注意：dsh 层版本与当前源码树强绑定（v1.4.0 适配 DSH 0.2.0-rc.2），
-# 升级 versionName / 换 DSH 版本时务必同步更新 RUNTIME_TAG，否则运行时会不匹配。
+# ===================== 运行环境大层的【正规来源】=====================
+# 这些层（base/node/android-side/dsh）是上游预编译的二进制，与 fork 的代码改动无关，
+# 因此直接复用上游官方 Release 已发布的版本。来源锁定规则：
+#   1. RUNTIME_REPO = WSK-build/DSHBox —— 本项目实际发布构建的组织（app 内置更新检查也
+#      指向 api.github.com/repos/WSK-build/DSHBox/releases/latest），即“正规来源”，
+#      不是随便一个仓库。你自己的 fork 也发布带这些层的 Release 后，把这里改回自己即可。
+#   2. RUNTIME_TAG / BUNDLE_BASENAME / DSH_LAYER_NAME 精确锁定版本与资产名，不拼接任意 URL。
+#   3. 下载走 https://github.com/<官方仓库>/releases/download/<Tag>/<资产名>，全程 TLS。
+#   4. 双层完整性校验：
+#      (a) 外层 SHA-256 钉（BUNDLE_SHA256 / DSH_LAYER_SHA256，见下）——首次成功构建后
+#          运行 sha256sum 把值填进来，此后每次构建都会比对，防来源被替换/投毒；留空则跳过。
+#      (b) App 首启时会按官方整包内【自带的每层 .sha256】逐项校验 base/node/android-side，
+#          确认字节级与上游发布一致（与 BUNDLE_SHA256 互补，不依赖你手动钉值）。
+# 注意版本强绑定：v1.4.0 适配 DSH 0.2.0-rc.2 / 离线整包 0.1.0。升级 versionName 或换 DSH
+# 版本时，必须同步更新 RUNTIME_TAG、BUNDLE_BASENAME、DSH_LAYER_NAME，否则运行时会报层不匹配。
 env:
   RUNTIME_REPO: WSK-build/DSHBox
   RUNTIME_TAG: v1.4.0
+  # 离线整包：含 base.tar.zst / node.tar.zst / android-side.tar.zst + 各自 .sha256 + runtime-profile.json
+  BUNDLE_BASENAME: dshapp-runtime-debian-arm64-0.1.0
+  # DSH 层（独立的官方 Release 资产）
+  DSH_LAYER_NAME: 0.2.0-rc.2.tar.zst
+  # 外层 SHA-256 钉（防御性，可选）。留空=跳过外层校验。首次成功构建后执行：
+  #   sha256sum 下载得到的 dshapp-runtime-debian-arm64-0.1.0.zip
+  #   sha256sum 下载得到的 0.2.0-rc.2.tar.zst
+  # 把输出填入下面两项，以后 CI 每次都会比对，防止官方资产被替换或中间人篡改。
+  BUNDLE_SHA256: ""
+  DSH_LAYER_SHA256: ""
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -67,14 +92,16 @@ jobs:
           yes | sdkmanager --licenses >/dev/null 2>&1 || true
           sdkmanager "platforms;android-36" "build-tools;36.0.0" "platform-tools"
 
+      # 给脚本加执行权限（runtime-bundle 不在仓库内时跳过，避免报错）
       - name: Grant execute permission to scripts
-        run: chmod +x gradlew tools/*.sh runtime-bundle/scripts/*.sh runtime-bundle/build_rootfs.sh
+        run: |
+          chmod +x gradlew tools/*.sh 2>/dev/null || true
+          chmod +x runtime-bundle/scripts/*.sh runtime-bundle/build_rootfs.sh 2>/dev/null || true
 
       # 运行环境大层（runtime/）不在仓库内，CI 不默认拉取；
       # 这里保证 assets.srcDirs 指向的目录存在，避免缺失目录导致装配报错。
-      # 不内嵌运行时层的 APK 仍然可用：首启会走「在线获取运行环境」现场组装。
       - name: Ensure runtime assets dir exists
-        run: mkdir -p runtime/android-assets
+        run: mkdir -p runtime/android-assets/runtime runtime/android-assets/dsh
 
       # 需要 python3 跑隐私审计
       - name: Set up Python
@@ -128,37 +155,89 @@ jobs:
           name: dshapp-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
 
-      # ===== 获取运行环境大层（仅 release 构建；从上游自包含 APK 提取预编译层） =====
-      # 上游 Release 里 android-side 与 dsh 层只随 APK / 离线整包分发，没有单独的
-      # 小体积资产；直接下载上游自包含 APK（含这两层），解包取出 assets/runtime/*
-      # 与 assets/dsh/* 落到 runtime/android-assets/，即可打出与上游等大的自包含包。
-      # 这一步只取运行环境二进制，不取上游 APK 里的 App 代码——App 仍由本 fork 源码编译。
-      - name: Fetch & embed runtime layers (release only)
+      # ===== 获取并内嵌运行环境大层（仅 release 且 self_contained）=====
+      # 来源：上游官方 Release（RUNTIME_REPO@RUNTIME_TAG），含：
+      #   · 离线整包 ${BUNDLE_BASENAME}.zip —— base/node/android-side 三层 + 每层 .sha256 + runtime-profile.json
+      #   · DSH 层 ${DSH_LAYER_NAME}            —— DeepSeek Harness 层
+      # 下载后：
+      #   · 外层 SHA-256（若已钉死）比对，防来源被替换；
+      #   · 解包离线整包，定位三层 + profile + 各自 .sha256（兼容扁平 / runtime/ 前缀两种官方布局），
+      #     扁平化拷入 runtime/android-assets/runtime/ → 打包后成为 assets/runtime/*；
+      #   · DSH 层直接拷入 runtime/android-assets/dsh/ → 打包后成为 assets/dsh/*。
+      # 这一步只取运行环境二进制，不取上游 APK 里的 App 代码——App 始终由本 fork 源码编译。
+      # 首启时 App 会：BundledRuntimeInstaller 装配 base/node/android-side，
+      # provisionBundledDsh 装配 DSH —— 全程离线，无需联网。
+      - name: Fetch & embed runtime layers (official release, self-contained)
         if: >-
           github.event_name == 'workflow_dispatch' &&
-          (inputs.build_release || inputs.unsigned)
+          (inputs.build_release || inputs.unsigned) &&
+          inputs.self_contained
         run: |
           set -euo pipefail
-          echo "从 ${RUNTIME_REPO}@${RUNTIME_TAG} 获取预编译运行环境层..."
-          # 用 GitHub API 找到自包含 APK 的下载地址（自动适配文件名，无需硬编码）
-          APK_URL=$(curl -fsSL "https://api.github.com/repos/${RUNTIME_REPO}/releases/tags/${RUNTIME_TAG}" \
-            | python3 -c "import sys,json;d=json.load(sys.stdin);print([a['browser_download_url'] for a in d['assets'] if a['name'].endswith('-release.apk')][0])")
-          echo "APK: $APK_URL"
-          curl -fsSL -L "$APK_URL" -o /tmp/upstream.apk
-          echo "已下载: $(du -h /tmp/upstream.apk | cut -f1)"
-          # 取出 APK 内嵌的两份运行环境层
-          rm -rf /tmp/apkassets && mkdir -p /tmp/apkassets
-          unzip -o /tmp/upstream.apk "assets/runtime/*" "assets/dsh/*" -d /tmp/apkassets >/dev/null
-          mkdir -p runtime/android-assets/runtime runtime/android-assets/dsh
-          cp -r /tmp/apkassets/assets/runtime/. runtime/android-assets/runtime/
-          cp -r /tmp/apkassets/assets/dsh/.    runtime/android-assets/dsh/
+          WORK=runtime/android-assets
+          TMP=$(mktemp -d)
+          echo "运行环境大层来源（正规）：${RUNTIME_REPO}@${RUNTIME_TAG}"
+
+          # ---- 1) 官方离线整包（base/node/android-side + 各自 .sha256 + profile）----
+          BUNDLE_URL="https://github.com/${RUNTIME_REPO}/releases/download/${RUNTIME_TAG}/${BUNDLE_BASENAME}.zip"
+          echo "下载离线整包：$BUNDLE_URL"
+          curl -fsSL -L "$BUNDLE_URL" -o "$TMP/bundle.zip"
+          echo "已下载离线整包: $(du -h "$TMP/bundle.zip" | cut -f1)"
+
+          if [ -n "${BUNDLE_SHA256:-}" ]; then
+            ACTUAL=$(sha256sum "$TMP/bundle.zip" | cut -d' ' -f1)
+            if [ "$ACTUAL" != "$BUNDLE_SHA256" ]; then
+              echo "::error::离线整包 SHA-256 不匹配（预期 ${BUNDLE_SHA256}，实际 ${ACTUAL}）"
+              exit 1
+            fi
+            echo "离线整包 SHA-256 校验通过"
+          else
+            echo "（外层 SHA-256 未钉死，跳过外层校验；App 首启仍会按整包内每层 .sha256 校验）"
+          fi
+
+          rm -rf "$TMP/ext" && mkdir -p "$TMP/ext"
+          unzip -o "$TMP/bundle.zip" -d "$TMP/ext" >/dev/null
+
+          # 定位三层（兼容 扁平 或 runtime/ 前缀两种官方布局），扁平化拷入 assets/runtime/
+          for layer in base node android-side; do
+            src=$(find "$TMP/ext" -type f -name "${layer}.tar.*" ! -name '*.sha256' | head -1)
+            [ -n "$src" ] || { echo "::error::离线整包缺少 ${layer}.tar.*"; exit 1; }
+            cp "$src" "$WORK/runtime/$(basename "$src")"
+            # 复制官方自带的每层 .sha256 校验副文件（App 首启会逐项校验，确认字节级与上游一致）
+            side=$(find "$TMP/ext" -type f -name "${layer}.tar.*.sha256" | head -1)
+            [ -n "$side" ] && cp "$side" "$WORK/runtime/$(basename "$side")"
+            echo "  + $(basename "$src")"
+          done
+          prof=$(find "$TMP/ext" -type f -name 'runtime-profile.json' | head -1)
+          [ -n "$prof" ] || { echo "::error::离线整包缺少 runtime-profile.json"; exit 1; }
+          cp "$prof" "$WORK/runtime/runtime-profile.json"
+          echo "  + runtime-profile.json"
+
+          # ---- 2) 官方 DSH 层（独立资产）----
+          DSH_URL="https://github.com/${RUNTIME_REPO}/releases/download/${RUNTIME_TAG}/${DSH_LAYER_NAME}"
+          echo "下载 DSH 层：$DSH_URL"
+          curl -fsSL -L "$DSH_URL" -o "$WORK/dsh/${DSH_LAYER_NAME}"
+          echo "已下载 DSH 层: $(du -h "$WORK/dsh/${DSH_LAYER_NAME}" | cut -f1)"
+          if [ -n "${DSH_LAYER_SHA256:-}" ]; then
+            ACTUAL=$(sha256sum "$WORK/dsh/${DSH_LAYER_NAME}" | cut -d' ' -f1)
+            if [ "$ACTUAL" != "$DSH_LAYER_SHA256" ]; then
+              echo "::error::DSH 层 SHA-256 不匹配"; exit 1
+            fi
+            echo "DSH 层 SHA-256 校验通过"
+          else
+            echo "（DSH 外层 SHA-256 未钉死，跳过外层校验；下载走官方 Release TLS）"
+          fi
+
+          rm -rf "$TMP"
           echo "已落地运行环境层："
-          ls -lhR runtime/android-assets
-          # 校验关键文件存在，缺失则明确报错（避免静默打出瘦包）
-          test -f runtime/android-assets/runtime/android-side.tar.zst \
-            || { echo "::error::缺少 android-side.tar.zst"; exit 1; }
-          test -n "$(ls runtime/android-assets/dsh/*.tar.zst 2>/dev/null)" \
-            || { echo "::error::缺少 dsh 层"; exit 1; }
+          ls -lhR "$WORK"
+
+          # 关键文件存在性校验，缺失则明确报错（避免静默打出瘦包）
+          test -f "$WORK/runtime/base.tar.zst" -a -f "$WORK/runtime/node.tar.zst" \
+               -a -f "$WORK/runtime/android-side.tar.zst" -a -f "$WORK/runtime/runtime-profile.json" \
+            || { echo "::error::运行环境层(base/node/android-side/profile)缺失"; exit 1; }
+          test -f "$WORK/dsh/${DSH_LAYER_NAME}" \
+            || { echo "::error::DSH 层缺失"; exit 1; }
 
       # ===== 手动触发的 Release 构建 =====
       # 仓库内没有发布密钥（keystore.properties / local.properties），
