@@ -5,6 +5,25 @@ on:
     branches: [ main, develop ]
   pull_request:
     branches: [ main, develop ]
+  # 手动触发：在仓库 Actions 页面点 “Run workflow” 即可。
+  # 两个输入项：
+  #   build_release —— 是否构建 Release APK（默认开）
+  #   unsigned      —— true 产出「真正未签名」的 APK（packageRelease，需自行用
+  #                    apksigner/jarsigner 重签后才能安装）；false 用 runner 自动生成的
+  #                    debug 密钥签名（即「无自有发布密钥」的 release，可直接侧载安装）。
+  # 想让打 tag（如 v1.4.0）时也自动出 release 包，可在此追加：
+  #   push:
+  #     tags: [ 'v*' ]
+  workflow_dispatch:
+    inputs:
+      build_release:
+        description: '构建 Release APK（手动触发时默认构建）'
+        type: boolean
+        default: true
+      unsigned:
+        description: 'true=真正未签名(需自行重签才能装)；false=用 debug 密钥签名(可直接侧载)'
+        type: boolean
+        default: false
 
 jobs:
   build:
@@ -39,6 +58,12 @@ jobs:
 
       - name: Grant execute permission to scripts
         run: chmod +x gradlew tools/*.sh runtime-bundle/scripts/*.sh runtime-bundle/build_rootfs.sh
+
+      # 运行环境大层（runtime/）不在仓库内，CI 不拉取；
+      # 这里保证 assets.srcDirs 指向的目录存在，避免缺失目录导致装配报错。
+      # 不内嵌运行时层的 APK 仍然可用：首启会走「在线获取运行环境」现场组装。
+      - name: Ensure runtime assets dir exists
+        run: mkdir -p runtime/android-assets
 
       # 需要 python3 跑隐私审计
       - name: Set up Python
@@ -91,3 +116,42 @@ jobs:
         with:
           name: dshapp-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
+
+      # ===== 手动触发的 Release 构建 =====
+      # 仓库内没有发布密钥（keystore.properties / local.properties），
+      # app/build.gradle.kts 中 release 构建会回退到 debug 签名配置，
+      # 因此 assembleRelease 在 CI 上可直接产出「用 debug 密钥签名的 release」，
+      # 也就是用户侧可侧载安装的「未用自有发布密钥签名」的 release 包。
+      - name: Assemble release APK (debug 密钥回退，可直接侧载)
+        if: >-
+          github.event_name == 'workflow_dispatch' &&
+          inputs.build_release && !inputs.unsigned
+        run: ./gradlew assembleRelease --stacktrace
+
+      # 真正「未签名」的 release：用 packageRelease 产出未签名 APK。
+      # 注意：Android 不允许安装完全未签名的 APK，该产物需自行用
+      #   $ANDROID_HOME/build-tools/36.0.0/apksigner sign --ks my.keystore app-release-unsigned.apk
+      # 或 jarsigner 重签后才能装入设备。
+      - name: Build unsigned release APK (packageRelease，需自行重签)
+        if: >-
+          github.event_name == 'workflow_dispatch' &&
+          inputs.unsigned
+        run: ./gradlew packageRelease --stacktrace
+
+      - name: Upload release APK
+        if: >-
+          github.event_name == 'workflow_dispatch' &&
+          inputs.build_release && !inputs.unsigned
+        uses: actions/upload-artifact@v4
+        with:
+          name: dshapp-release-apk
+          path: app/build/outputs/apk/release/app-release.apk
+
+      - name: Upload unsigned release APK
+        if: >-
+          github.event_name == 'workflow_dispatch' &&
+          inputs.unsigned
+        uses: actions/upload-artifact@v4
+        with:
+          name: dshapp-release-unsigned-apk
+          path: app/build/outputs/apk/release/**/*unsigned*.apk
