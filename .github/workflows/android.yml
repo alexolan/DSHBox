@@ -25,6 +25,17 @@ on:
         type: boolean
         default: false
 
+# 运行环境大层的来源（仅 release 构建需要）。
+# 这些层是上游预编译的二进制（PRoot / DSH），与 fork 的代码改动无关，
+# 因此直接复用上游 Release 里已经打好、内嵌进 APK 的那两份：
+#   assets/runtime/android-side.tar.zst  —— 宿主侧 PRoot / loader / shmem
+#   assets/dsh/*.tar.zst                —— DeepSeek Harness 层
+# 注意：dsh 层版本与当前源码树强绑定（v1.4.0 适配 DSH 0.2.0-rc.2），
+# 升级 versionName / 换 DSH 版本时务必同步更新 RUNTIME_TAG，否则运行时会不匹配。
+env:
+  RUNTIME_REPO: WSK-build/DSHBox
+  RUNTIME_TAG: v1.4.0
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -59,7 +70,7 @@ jobs:
       - name: Grant execute permission to scripts
         run: chmod +x gradlew tools/*.sh runtime-bundle/scripts/*.sh runtime-bundle/build_rootfs.sh
 
-      # 运行环境大层（runtime/）不在仓库内，CI 不拉取；
+      # 运行环境大层（runtime/）不在仓库内，CI 不默认拉取；
       # 这里保证 assets.srcDirs 指向的目录存在，避免缺失目录导致装配报错。
       # 不内嵌运行时层的 APK 仍然可用：首启会走「在线获取运行环境」现场组装。
       - name: Ensure runtime assets dir exists
@@ -116,6 +127,38 @@ jobs:
         with:
           name: dshapp-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
+
+      # ===== 获取运行环境大层（仅 release 构建；从上游自包含 APK 提取预编译层） =====
+      # 上游 Release 里 android-side 与 dsh 层只随 APK / 离线整包分发，没有单独的
+      # 小体积资产；直接下载上游自包含 APK（含这两层），解包取出 assets/runtime/*
+      # 与 assets/dsh/* 落到 runtime/android-assets/，即可打出与上游等大的自包含包。
+      # 这一步只取运行环境二进制，不取上游 APK 里的 App 代码——App 仍由本 fork 源码编译。
+      - name: Fetch & embed runtime layers (release only)
+        if: >-
+          github.event_name == 'workflow_dispatch' &&
+          (inputs.build_release || inputs.unsigned)
+        run: |
+          set -euo pipefail
+          echo "从 ${RUNTIME_REPO}@${RUNTIME_TAG} 获取预编译运行环境层..."
+          # 用 GitHub API 找到自包含 APK 的下载地址（自动适配文件名，无需硬编码）
+          APK_URL=$(curl -fsSL "https://api.github.com/repos/${RUNTIME_REPO}/releases/tags/${RUNTIME_TAG}" \
+            | python3 -c "import sys,json;d=json.load(sys.stdin);print([a['browser_download_url'] for a in d['assets'] if a['name'].endswith('-release.apk')][0])")
+          echo "APK: $APK_URL"
+          curl -fsSL -L "$APK_URL" -o /tmp/upstream.apk
+          echo "已下载: $(du -h /tmp/upstream.apk | cut -f1)"
+          # 取出 APK 内嵌的两份运行环境层
+          rm -rf /tmp/apkassets && mkdir -p /tmp/apkassets
+          unzip -o /tmp/upstream.apk "assets/runtime/*" "assets/dsh/*" -d /tmp/apkassets >/dev/null
+          mkdir -p runtime/android-assets/runtime runtime/android-assets/dsh
+          cp -r /tmp/apkassets/assets/runtime/. runtime/android-assets/runtime/
+          cp -r /tmp/apkassets/assets/dsh/.    runtime/android-assets/dsh/
+          echo "已落地运行环境层："
+          ls -lhR runtime/android-assets
+          # 校验关键文件存在，缺失则明确报错（避免静默打出瘦包）
+          test -f runtime/android-assets/runtime/android-side.tar.zst \
+            || { echo "::error::缺少 android-side.tar.zst"; exit 1; }
+          test -n "$(ls runtime/android-assets/dsh/*.tar.zst 2>/dev/null)" \
+            || { echo "::error::缺少 dsh 层"; exit 1; }
 
       # ===== 手动触发的 Release 构建 =====
       # 仓库内没有发布密钥（keystore.properties / local.properties），
